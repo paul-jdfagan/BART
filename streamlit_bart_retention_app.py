@@ -131,25 +131,41 @@ test_df = df[df[period_col] > split_dt].copy()
 st.write(f"**Train rows:** {len(train_df)}  |  **Test rows:** {len(test_df)}")
 
 # ------------------------------
-# Exploratory Plots (match notebook) — moved AFTER split
+# Exploratory Plots (match notebook) — AFTER split
 # ------------------------------
 st.header("Exploratory Views")
 
-# Heatmap: Retention by Cohort x Period (train only)
+# Robust formatters for labels
+def _fmt_cohort_col(d: pd.Series) -> pd.Series:
+    # If cohort is datetime-like, format as YYYY-MM; else use string
+    if np.issubdtype(d.dtype, np.datetime64):
+        return d.dt.strftime("%Y-%m")
+    return d.astype(str)
+
+def _fmt_period_col(d: pd.Series) -> pd.Series:
+    return d.dt.strftime("%Y-%m")
+
 if not train_df.empty:
-    heat_df = (
-        train_df.assign(
-            cohort_fmt=lambda d: (
-                d[cohort_col].dt.strftime("%Y-%m")
-                if np.issubdtype(train_df[cohort_col].dtype, np.datetime64)
-                else d[cohort_col].astype(str)
-            ),
-            period_fmt=lambda d: d[period_col].dt.strftime("%Y-%m"),
-        )
-        .query("retention.notnull()")
-        .filter(items=["cohort_fmt", "period_fmt", "retention"])
-        .pivot(index="cohort_fmt", columns="period_fmt", values="retention")
+    # 1) Heatmap: Retention by Cohort x Period (train only), handling duplicates
+    _tmp = train_df.copy()
+    _tmp["cohort_fmt"] = _fmt_cohort_col(_tmp[cohort_col])
+    _tmp["period_fmt"] = _fmt_period_col(_tmp[period_col])
+    _tmp = _tmp.dropna(subset=["retention"])
+
+    # Aggregate duplicates (mean retention per cohort-period)
+    agg_heat = (
+        _tmp.groupby(["cohort_fmt", "period_fmt"], as_index=False)["retention"]
+            .mean()
     )
+
+    heat_df = agg_heat.pivot_table(
+        index="cohort_fmt",
+        columns="period_fmt",
+        values="retention",
+        aggfunc="mean",   # safe even if duplicates sneak in
+        fill_value=np.nan
+    ).sort_index().sort_index(axis=1)
+
     fig_h, ax_h = plt.subplots(figsize=(17, 9))
     fmt = lambda y, _: f"{y:0.0%}"
     sns.heatmap(
@@ -165,22 +181,25 @@ if not train_df.empty:
     ax_h.set_title("Retention by Cohort and Period (Train)")
     st.pyplot(fig_h)
 
-# Line plot: Retention by Cohort over Period (train)
-if not train_df.empty:
-    fig_l, ax_l = plt.subplots(figsize=(12, 7))
-    plot_df = train_df.assign(
-        cohort_fmt=lambda d: (
-            d[cohort_col].dt.strftime("%Y-%m")
-            if np.issubdtype(train_df[cohort_col].dtype, np.datetime64)
-            else d[cohort_col].astype(str)
-        )
+    # 2) Line plot: average retention by cohort & period to avoid overplotting
+    agg_line = (
+        agg_heat.sort_values(["cohort_fmt", "period_fmt"])
     )
+
+    fig_l, ax_l = plt.subplots(figsize=(12, 7))
     sns.lineplot(
-        x=period_col, y="retention", hue="cohort_fmt",
-        palette="viridis_r", alpha=0.8, data=plot_df, ax=ax_l
+        x="period_fmt",
+        y="retention",
+        hue="cohort_fmt",
+        palette="viridis_r",
+        alpha=0.8,
+        data=agg_line,
+        ax=ax_l,
+        marker="o"
     )
     ax_l.legend(title="cohort", loc="center left", bbox_to_anchor=(1, 0.5), fontsize=7.5)
-    ax_l.set(title="Retention by Cohort and Period")
+    ax_l.set(title="Retention by Cohort and Period", xlabel="Period (YYYY-MM)", ylabel="Retention")
+    plt.setp(ax_l.get_xticklabels(), rotation=45, ha="right")
     st.pyplot(fig_l)
 
 # ------------------------------
