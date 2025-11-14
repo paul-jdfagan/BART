@@ -14,7 +14,7 @@ from pymc_bart.split_rules import ContinuousSplitRule, SubsetSplitRule
 from datetime import datetime
 
 # Page config
-st.set_page_config(page_title="BART Retention Analysis", layout="wide", page_icon="📊")
+st.set_page_config(page_title="BART Retention Analysis", layout="wide", page_icon="")
 
 # Style settings
 az.style.use("arviz-darkgrid")
@@ -23,14 +23,14 @@ plt.rcParams["figure.dpi"] = 100
 plt.rcParams["figure.facecolor"] = "white"
 
 # App title
-st.title("📊 BART Retention Analysis")
+st.title(" BART Retention Analysis")
 st.markdown("""
 This app performs Bayesian retention modeling using BART (Bayesian Additive Regression Trees).
 Upload your own retention data or use the synthetic dataset.
 """)
 
 # Sidebar
-st.sidebar.header("⚙️ Configuration")
+st.sidebar.header(" Configuration")
 
 # Data source selection
 data_source = st.sidebar.radio(
@@ -82,16 +82,16 @@ else:
             st.sidebar.error(msg)
             st.stop()
     else:
-        st.info("👆 Please upload a CSV file to continue")
+        st.info(" Please upload a CSV file to continue")
         st.stop()
 
 # Data preview
-with st.expander("📋 View Raw Data", expanded=False):
+with st.expander(" View Raw Data", expanded=False):
     st.dataframe(data_df.head(20), use_container_width=True)
     st.write(f"**Shape:** {data_df.shape[0]} rows × {data_df.shape[1]} columns")
 
 # Model configuration
-st.sidebar.header("🎯 Model Settings")
+st.sidebar.header(" Model Settings")
 
 # Train/test split
 split_date = st.sidebar.date_input(
@@ -133,7 +133,7 @@ def preprocess_data(df, split_date):
 train_data_red_df, test_data_red_df = preprocess_data(data_df, period_train_test_split)
 
 # EDA Section
-st.header("📈 Exploratory Data Analysis")
+st.header(" Exploratory Data Analysis")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -191,9 +191,9 @@ if st.checkbox("Show Retention Trends", value=True):
     plt.close()
 
 # Model fitting section
-st.header("🤖 Model Training")
+st.header(" Model Training")
 
-if st.button("🚀 Fit BART Model", type="primary"):
+if st.button(" Fit BART Model", type="primary"):
     with st.spinner("Fitting BART model... This may take several minutes."):
         try:
             # Prepare data exactly as in original code
@@ -269,7 +269,7 @@ if st.button("🚀 Fit BART Model", type="primary"):
             st.session_state.mu = mu
             st.session_state.test_data_red_df = test_data_red_df
             
-            st.success("✅ Model fitted successfully!")
+            st.success(" Model fitted successfully!")
             st.rerun()
             
         except Exception as e:
@@ -279,7 +279,7 @@ if st.button("🚀 Fit BART Model", type="primary"):
 
 # Display results if model is fitted
 if st.session_state.model_fitted:
-    st.header("📊 Model Diagnostics")
+    st.header(" Model Diagnostics")
     
     idata = st.session_state.idata
     posterior_predictive = st.session_state.posterior_predictive
@@ -386,7 +386,7 @@ if st.session_state.model_fitted:
         plt.close()
     
     # HDI Plots for subset of cohorts (exactly as in original code)
-    st.header("🎯 In-Sample Retention HDI")
+    st.header(" In-Sample Retention HDI")
     
     train_retention_hdi = az.hdi(ary=train_posterior_retention)["likelihood"]
     
@@ -447,7 +447,7 @@ if st.session_state.model_fitted:
     plt.close()
     
     # PDP Plots (exactly as in original code)
-    st.header("📉 Partial Dependence Plots (PDP)")
+    st.header(" Partial Dependence Plots (PDP)")
     
     with st.spinner("Computing PDP plots..."):
         try:
@@ -508,7 +508,7 @@ if st.session_state.model_fitted:
             st.error(f"Error computing ICE: {str(e)}")
     
     # Variable Importance (exactly as in original code)
-    st.header("🔍 Variable Importance")
+    st.header(" Variable Importance")
     
     with st.spinner("Computing variable importance..."):
         try:
@@ -554,7 +554,7 @@ if st.session_state.model_fitted:
             st.warning(f"Could not compute variable importance: {str(e)}")
     
     # Out-of-Sample Predictions
-    st.header("🔮 Out-of-Sample Predictions")
+    st.header(" Out-of-Sample Predictions")
     
     if st.button("Generate Test Predictions"):
         with st.spinner("Generating out-of-sample predictions..."):
@@ -596,7 +596,7 @@ if st.session_state.model_fitted:
                 st.session_state.test_retention = test_retention
                 st.session_state.test_n_users = test_n_users
                 
-                st.success("✅ Test predictions generated!")
+                st.success(" Test predictions generated!")
                 st.rerun()
                 
             except Exception as e:
