@@ -1,402 +1,671 @@
-import os
-import warnings
-warnings.filterwarnings("ignore")
-
 import streamlit as st
-import pandas as pd
+import arviz as az
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
 import numpy as np
+import pandas as pd
 import pymc as pm
 import pymc_bart as pmb
 import pytensor.tensor as pt
-import arviz as az
-import matplotlib.pyplot as plt
 import seaborn as sns
-import matplotlib.ticker as mtick
-
-from io import StringIO
-from datetime import datetime
+from scipy.special import expit, logit
 from sklearn.preprocessing import LabelEncoder
 from pymc_bart.split_rules import ContinuousSplitRule, SubsetSplitRule
+from datetime import datetime
 
-# ------------------------------
-# App Config
-# ------------------------------
-st.set_page_config(page_title="BART Retention Analysis", layout="wide")
-st.title("BART Retention Analysis")
-st.caption("Guided workflow based on the shared BART retention notebook.")
+# Page config
+st.set_page_config(page_title="BART Retention Analysis", layout="wide", page_icon="📊")
 
-# ------------------------------
-# Helpers
-# ------------------------------
-@st.cache_data
-def load_csv(file) -> pd.DataFrame:
-    return pd.read_csv(file)
+# Style settings
+az.style.use("arviz-darkgrid")
+plt.rcParams["figure.figsize"] = [12, 7]
+plt.rcParams["figure.dpi"] = 100
+plt.rcParams["figure.facecolor"] = "white"
 
-def ensure_datetime(series: pd.Series) -> pd.Series:
-    if np.issubdtype(series.dtype, np.datetime64):
-        return series
-    return pd.to_datetime(series, errors="coerce")
+# App title
+st.title("📊 BART Retention Analysis")
+st.markdown("""
+This app performs Bayesian retention modeling using BART (Bayesian Additive Regression Trees).
+Upload your own retention data or use the synthetic dataset.
+""")
 
-def compute_retention(df: pd.DataFrame, kept_col: str, active_col: str) -> pd.Series:
-    denom = df[active_col].replace(0, np.nan)
-    return (df[kept_col] / denom).clip(0, 1)
+# Sidebar
+st.sidebar.header("⚙️ Configuration")
 
-def line_ci(ax, x, y_mean, y_low, y_high, label=None):
-    ax.plot(x, y_mean, label=label)
-    ax.fill_between(x, y_low, y_high, alpha=0.2)
-
-def prepare_design_matrix(df, period_col, cohort_col):
-    t = (df[period_col] - df[period_col].min()).dt.days.astype(float)
-    le = LabelEncoder()
-    c = le.fit_transform(df[cohort_col].astype(str)).astype(float)
-    X = np.column_stack([t, c])
-    return X, t, c, le
-
-# ------------------------------
-# Sidebar: Data Input
-# ------------------------------
-st.sidebar.header("1) Data")
-uploaded = st.sidebar.file_uploader("Upload CSV", type=["csv"])
-example = st.sidebar.checkbox("Use synthetic example", value=False)
-
-if uploaded is not None:
-    df = load_csv(uploaded)
-elif example:
-    rng = np.random.default_rng(42)
-    dates = pd.date_range("2024-01-01", periods=120, freq="D")
-    cohorts = ["A", "B", "C"]
-    rows = []
-    for ci, c in enumerate(cohorts):
-        base = 0.45 + 0.05 * ci
-        trend = np.linspace(0, 0.1, len(dates))
-        for i, d in enumerate(dates):
-            n = rng.integers(80, 160)
-            p = np.clip(base + trend[i] + rng.normal(0, 0.03), 0.01, 0.99)
-            kept = rng.binomial(n, p)
-            rows.append({"period": d, "cohort": c, "n_active_users": n, "n_retained": kept})
-    df = pd.DataFrame(rows)
-else:
-    st.info("Upload a CSV or tick 'Use synthetic example' to proceed.")
-    st.stop()
-
-st.write("**Preview**")
-st.dataframe(df.head(20), use_container_width=True)
-
-# ------------------------------
-# Sidebar: Column Mapping
-# ------------------------------
-st.sidebar.header("2) Map Columns")
-all_cols = df.columns.tolist()
-
-default_period = "period" if "period" in all_cols else all_cols[0]
-default_cohort = "cohort" if "cohort" in all_cols else all_cols[1] if len(all_cols) > 1 else all_cols[0]
-default_n_active = "n_active_users" if "n_active_users" in all_cols else all_cols[-2] if len(all_cols) >= 2 else all_cols[0]
-default_n_kept = "n_retained" if "n_retained" in all_cols else all_cols[-1]
-
-period_col = st.sidebar.selectbox("Period (date)", options=all_cols, index=all_cols.index(default_period))
-cohort_col = st.sidebar.selectbox("Cohort (group)", options=all_cols, index=all_cols.index(default_cohort))
-n_active_col = st.sidebar.selectbox("Active (denominator)", options=all_cols, index=all_cols.index(default_n_active))
-n_kept_col = st.sidebar.selectbox("Retained (successes)", options=all_cols, index=all_cols.index(default_n_kept))
-
-# Clean types
-df = df.copy()
-df[period_col] = ensure_datetime(df[period_col])
-df = df.dropna(subset=[period_col])
-df[n_active_col] = pd.to_numeric(df[n_active_col], errors="coerce")
-df[n_kept_col] = pd.to_numeric(df[n_kept_col], errors="coerce")
-df = df.dropna(subset=[n_active_col, n_kept_col])
-
-# Derived retention
-df["retention"] = compute_retention(df, kept_col=n_kept_col, active_col=n_active_col)
-st.write("**Derived columns:** `retention = n_retained / n_active_users` (clipped to [0,1]).")
-st.dataframe(df[[period_col, cohort_col, n_active_col, n_kept_col, "retention"]].head(20), use_container_width=True)
-
-# ------------------------------
-# Sidebar: Train/Test Split
-# ------------------------------
-st.sidebar.header("3) Train/Test Split")
-min_date = df[period_col].min()
-max_date = df[period_col].max()
-split_date = st.sidebar.date_input(
-    "Train/Test split date",
-    value=min_date + (max_date - min_date) // 2,
-    min_value=min_date.date(),
-    max_value=max_date.date()
+# Data source selection
+data_source = st.sidebar.radio(
+    "Select Data Source:",
+    ["Use Synthetic Data", "Upload Custom Data"]
 )
 
-# Partition
-split_dt = pd.to_datetime(split_date)
-train_df = df[df[period_col] <= split_dt].copy()
-test_df = df[df[period_col] > split_dt].copy()
-st.write(f"**Train rows:** {len(train_df)}  |  **Test rows:** {len(test_df)}")
+# Session state initialization
+if 'model_fitted' not in st.session_state:
+    st.session_state.model_fitted = False
 
-# ------------------------------
-# Exploratory Plots (match notebook) — AFTER split
-# ------------------------------
-st.header("Exploratory Views")
+# Function to load data
+@st.cache_data
+def load_synthetic_data():
+    """Load the synthetic retention dataset"""
+    url = "https://raw.githubusercontent.com/juanitorduz/website_projects/master/data/retention_data.csv"
+    df = pd.read_csv(url, parse_dates=["cohort", "period"])
+    return df
 
-# Robust formatters for labels
-def _fmt_cohort_col(d: pd.Series) -> pd.Series:
-    # If cohort is datetime-like, format as YYYY-MM; else use string
-    if np.issubdtype(d.dtype, np.datetime64):
-        return d.dt.strftime("%Y-%m")
-    return d.astype(str)
+def validate_uploaded_data(df):
+    """Validate uploaded data has required columns"""
+    required_cols = ['cohort', 'period', 'n_users', 'n_active_users', 'retention', 'cohort_age', 'age']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    
+    if missing_cols:
+        return False, f"Missing required columns: {', '.join(missing_cols)}"
+    
+    return True, "Data validated successfully!"
 
-def _fmt_period_col(d: pd.Series) -> pd.Series:
-    return d.dt.strftime("%Y-%m")
-
-if not train_df.empty:
-    # 1) Heatmap: Retention by Cohort x Period (train only), handling duplicates
-    _tmp = train_df.copy()
-    _tmp["cohort_fmt"] = _fmt_cohort_col(_tmp[cohort_col])
-    _tmp["period_fmt"] = _fmt_period_col(_tmp[period_col])
-    _tmp = _tmp.dropna(subset=["retention"])
-
-    # Aggregate duplicates (mean retention per cohort-period)
-    agg_heat = (
-        _tmp.groupby(["cohort_fmt", "period_fmt"], as_index=False)["retention"]
-            .mean()
+# Load or upload data
+if data_source == "Use Synthetic Data":
+    with st.spinner("Loading synthetic data..."):
+        data_df = load_synthetic_data()
+        st.sidebar.success("✅ Synthetic data loaded!")
+else:
+    uploaded_file = st.sidebar.file_uploader(
+        "Upload CSV file",
+        type=['csv'],
+        help="CSV should contain: cohort, period, n_users, n_active_users, retention, cohort_age, age"
     )
+    
+    if uploaded_file is not None:
+        data_df = pd.read_csv(uploaded_file, parse_dates=["cohort", "period"])
+        is_valid, msg = validate_uploaded_data(data_df)
+        
+        if is_valid:
+            st.sidebar.success(msg)
+        else:
+            st.sidebar.error(msg)
+            st.stop()
+    else:
+        st.info("👆 Please upload a CSV file to continue")
+        st.stop()
 
-    heat_df = agg_heat.pivot_table(
-        index="cohort_fmt",
-        columns="period_fmt",
-        values="retention",
-        aggfunc="mean",   # safe even if duplicates sneak in
-        fill_value=np.nan
-    ).sort_index().sort_index(axis=1)
+# Data preview
+with st.expander("📋 View Raw Data", expanded=False):
+    st.dataframe(data_df.head(20), use_container_width=True)
+    st.write(f"**Shape:** {data_df.shape[0]} rows × {data_df.shape[1]} columns")
 
-    fig_h, ax_h = plt.subplots(figsize=(17, 9))
+# Model configuration
+st.sidebar.header("🎯 Model Settings")
+
+# Train/test split
+split_date = st.sidebar.date_input(
+    "Train/Test Split Date",
+    value=pd.to_datetime("2022-11-01").date(),
+    min_value=data_df['period'].min().date(),
+    max_value=data_df['period'].max().date()
+)
+period_train_test_split = pd.to_datetime(split_date)
+
+# BART parameters
+n_trees = st.sidebar.slider("Number of Trees (m)", 50, 200, 100, 10)
+n_draws = st.sidebar.slider("MCMC Draws", 500, 3000, 2000, 500)
+n_chains = st.sidebar.slider("MCMC Chains", 2, 8, 5, 1)
+
+# Fixed features as in original code
+features = ["age", "cohort_age", "month"]
+split_rules = [ContinuousSplitRule(), ContinuousSplitRule(), SubsetSplitRule()]
+
+# Data preprocessing
+@st.cache_data
+def preprocess_data(df, split_date):
+    """Preprocess data for modeling - exactly as in original code"""
+    train_df = df.query("period <= @split_date")
+    test_df = df.query("period > @split_date")
+    test_df = test_df[test_df["cohort"].isin(train_df["cohort"].unique())]
+    
+    # Train data
+    train_red_df = train_df.query("cohort_age > 0").reset_index(drop=True)
+    train_red_df["month"] = train_red_df["period"].dt.strftime("%m").astype(int)
+    
+    # Test data
+    test_red_df = test_df.query("cohort_age > 0")
+    test_red_df = test_red_df[test_red_df["cohort"].isin(train_red_df["cohort"].unique())].reset_index(drop=True)
+    test_red_df["month"] = test_red_df["period"].dt.strftime("%m").astype(int)
+    
+    return train_red_df, test_red_df
+
+train_data_red_df, test_data_red_df = preprocess_data(data_df, period_train_test_split)
+
+# EDA Section
+st.header("📈 Exploratory Data Analysis")
+
+col1, col2 = st.columns(2)
+with col1:
+    st.metric("Training Samples", len(train_data_red_df))
+    st.metric("Test Samples", len(test_data_red_df))
+with col2:
+    st.metric("Unique Cohorts", train_data_red_df['cohort'].nunique())
+    st.metric("Date Range", f"{data_df['period'].min().date()} to {data_df['period'].max().date()}")
+
+# Retention heatmap (from original code)
+if st.checkbox("Show Retention Heatmap", value=True):
+    fig, ax = plt.subplots(figsize=(17, 9))
     fmt = lambda y, _: f"{y:0.0%}"
-    sns.heatmap(
-        heat_df,
-        cmap="viridis_r",
-        linewidths=0.2,
-        linecolor="black",
-        annot=True,
-        fmt="0.0%",
-        cbar_kws={"format": mtick.FuncFormatter(fmt)},
-        ax=ax_h,
+    
+    (
+        train_data_red_df.assign(
+            cohort=lambda df: df["cohort"].dt.strftime("%Y-%m"),
+            period=lambda df: df["period"].dt.strftime("%Y-%m"),
+        )
+        .query("cohort_age != 0")
+        .filter(["cohort", "period", "retention"])
+        .pivot(index="cohort", columns="period", values="retention")
+        .pipe(
+            (sns.heatmap, "data"),
+            cmap="viridis_r",
+            linewidths=0.2,
+            linecolor="black",
+            annot=True,
+            fmt="0.0%",
+            cbar_kws={"format": mtick.FuncFormatter(fmt)},
+            ax=ax,
+        )
     )
-    ax_h.set_title("Retention by Cohort and Period (Train)")
-    st.pyplot(fig_h)
+    ax.set_title("Retention by Cohort and Period")
+    st.pyplot(fig)
+    plt.close()
 
-    # 2) Line plot: average retention by cohort & period to avoid overplotting
-    agg_line = (
-        agg_heat.sort_values(["cohort_fmt", "period_fmt"])
-    )
-
-    fig_l, ax_l = plt.subplots(figsize=(12, 7))
+# Retention trends (from original code)
+if st.checkbox("Show Retention Trends", value=True):
+    fig, ax = plt.subplots(figsize=(12, 7))
     sns.lineplot(
-        x="period_fmt",
+        x="period",
         y="retention",
-        hue="cohort_fmt",
+        hue="cohort",
         palette="viridis_r",
         alpha=0.8,
-        data=agg_line,
-        ax=ax_l,
-        marker="o"
+        data=train_data_red_df.query("cohort_age > 0").assign(
+            cohort=lambda df: df["cohort"].dt.strftime("%Y-%m")
+        ),
+        ax=ax,
     )
-    ax_l.legend(title="cohort", loc="center left", bbox_to_anchor=(1, 0.5), fontsize=7.5)
-    ax_l.set(title="Retention by Cohort and Period", xlabel="Period (YYYY-MM)", ylabel="Retention")
-    plt.setp(ax_l.get_xticklabels(), rotation=45, ha="right")
-    st.pyplot(fig_l)
-
-# ------------------------------
-# Sidebar: Model Settings
-# ------------------------------
-st.sidebar.header("4) Model Settings (BART)")
-m_trees = st.sidebar.slider("Number of trees (m)", min_value=50, max_value=200, value=100, step=10)
-draws = st.sidebar.slider("Draws", min_value=500, max_value=3000, value=1000, step=100)
-tune = st.sidebar.slider("Tune", min_value=500, max_value=3000, value=1000, step=100)
-chains = st.sidebar.slider("Chains", min_value=2, max_value=6, value=2, step=1)
-target_accept = st.sidebar.slider("target_accept", min_value=0.80, max_value=0.99, value=0.9, step=0.01)
-hdi_prob = st.sidebar.slider("HDI probability", min_value=0.50, max_value=0.99, value=0.94, step=0.01)
-
-# ------------------------------
-# Build Design Matrices
-# ------------------------------
-train_df = train_df.sort_values([cohort_col, period_col])
-test_df = test_df.sort_values([cohort_col, period_col])
-
-X_train, t_train, c_train, le = prepare_design_matrix(train_df, period_col, cohort_col)
-X_test, t_test, c_test, _ = prepare_design_matrix(test_df, period_col, cohort_col)
-
-# logit of observed retention for training
-eps = 1e-6
-train_retention = np.clip(train_df["retention"].values, eps, 1 - eps)
-train_retention_logit = np.log(train_retention / (1 - train_retention))
-
-n_active_train = train_df[n_active_col].values.astype(int)
-n_kept_train = train_df[n_kept_col].values.astype(int)
-
-# ------------------------------
-# Model (with MutableData/Data compatibility)
-# ------------------------------
-st.header("Model Fit")
-
-DataVar = pm.MutableData if hasattr(pm, "MutableData") else pm.Data
-
-coords = {
-    "obs": np.arange(len(train_df)),
-    "features": np.arange(X_train.shape[1]),
-}
-
-with st.spinner("Sampling..."):
-    with pm.Model(coords=coords) as model:
-        x = DataVar("x", X_train, dims=("obs", "features"))
-        n_obs = DataVar("n", n_active_train, dims="obs")
-
-        mu = pmb.BART(
-            name="mu",
-            X=x,
-            Y=train_retention_logit,
-            m=m_trees,
-            response="mix",
-            split_rules=[ContinuousSplitRule(), SubsetSplitRule()],
-            dims="obs",
-        )
-
-        p = pm.Deterministic("p", pm.math.invlogit(mu), dims="obs")
-        p = pt.clip(p, eps, 1 - eps)
-
-        retained = pm.Binomial("retained", n=n_obs, p=p, observed=n_kept_train, dims="obs")
-
-        idata = pm.sample(
-            draws=draws, tune=tune, chains=chains, target_accept=target_accept,
-            progressbar=True, random_seed=42
-        )
-
-st.success("Sampling complete.")
-
-# Diagnostics
-st.subheader("Diagnostics")
-st.write(az.summary(idata, var_names=["~retained"]).round(3))
-
-# ESS ECDF and R-hat histogram for 'mu'
-fig_d, ax_d = plt.subplots(nrows=1, ncols=2, figsize=(10, 4), layout="constrained")
-ess_data = az.ess(idata, var_names=["mu"], method="bulk")
-rhat_data = az.rhat(idata, var_names=["mu"])
-
-ess_values = ess_data["mu"].values.flatten()
-rhat_values = rhat_data["mu"].values.flatten()
-
-# ESS ECDF
-ess_sorted = np.sort(ess_values)
-ess_ecdf = np.arange(1, len(ess_sorted) + 1) / len(ess_sorted)
-ax_d[0].plot(ess_sorted, ess_ecdf, linewidth=2)
-ax_d[0].set(title="ESS ECDF (mu)", xlabel="ESS", ylabel="ECDF")
-
-# R-hat histogram
-ax_d[1].hist(rhat_values, bins=30, edgecolor="black", alpha=0.7)
-ax_d[1].axvline(1.01, color="red", linestyle="--", label="1.01")
-ax_d[1].set(title="R-hat Histogram (mu)", xlabel="R-hat", ylabel="Frequency")
-ax_d[1].legend()
-
-fig_d.suptitle("Diagnostics of the BART Component", y=1.06, fontsize=16)
-st.pyplot(fig_d)
-
-# Posterior Predictive Check (cumulative)
-with model:
-    posterior_predictive = pm.sample_posterior_predictive(idata, random_seed=42, progressbar=False)
-ax_ppc = az.plot_ppc(
-    data=posterior_predictive, kind="cumulative", observed_rug=True, random_seed=42
-)
-ax_ppc.set(
-    title="Posterior Predictive Check",
-    xscale="log",
-    xlabel="likelihood (n_active_users) - log scale",
-)
-st.pyplot(ax_ppc.figure)
-
-# ------------------------------
-# Posterior predictions for Train & Test
-# ------------------------------
-# Train: use posterior 'p' directly
-p_train = az.extract(idata, var_names=["p"]).to_array().squeeze().values
-
-# Test: update data and predict 'p' via posterior predictive
-with model:
-    pm.set_data({"x": X_test})
-    if len(test_df):
-        pp_test = pm.sample_posterior_predictive(
-            idata, var_names=["p"], predictions=True, extend_inferencedata=False, progressbar=False
-        )
-        p_test = pp_test["p"]
-    else:
-        p_test = np.empty((p_train.shape[0], 0))
-
-# ------------------------------
-# Build plot data by cohort and period
-# ------------------------------
-def build_plot_frame(df_sub, p_samples, label: str):
-    if p_samples.ndim == 3:
-        samples_flat = p_samples.reshape(-1, p_samples.shape[-1])
-    else:
-        samples_flat = p_samples
-    if samples_flat.size == 0:
-        return pd.DataFrame(columns=[period_col, cohort_col, "p_mean", "p_low", "p_high", "phase"])
-    p_mean = samples_flat.mean(axis=0)
-    hdi = az.hdi(samples_flat, hdi_prob=hdi_prob)
-    plot_df = df_sub[[period_col, cohort_col]].copy()
-    plot_df["p_mean"] = p_mean
-    plot_df["p_low"] = hdi[:, 0]
-    plot_df["p_high"] = hdi[:, 1]
-    plot_df["phase"] = label
-    return plot_df
-
-plot_train = build_plot_frame(train_df, p_train, "train")
-plot_test = build_plot_frame(test_df, p_test, "test")
-plot_all = pd.concat([plot_train, plot_test], ignore_index=True)
-
-# ------------------------------
-# Plots
-# ------------------------------
-st.header("Retention Predictions")
-cohorts_list = list(plot_all[cohort_col].astype(str).unique())
-selected_cohorts = st.multiselect(
-    "Select cohorts to display",
-    options=cohorts_list,
-    default=cohorts_list[:min(4, len(cohorts_list))]
-)
-
-if selected_cohorts:
-    ncols = 2
-    nrows = int(np.ceil(len(selected_cohorts) / ncols))
-    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(16, 6 * nrows), sharex=False, sharey=False)
-    axes = np.atleast_2d(axes)
-
-    for i, cohort in enumerate(selected_cohorts):
-        ax = axes[i // ncols, i % ncols]
-        sub = plot_all[plot_all[cohort_col].astype(str) == str(cohort)].sort_values(period_col)
-        train_sub = sub[sub["phase"] == "train"]
-        if not train_sub.empty:
-            line_ci(ax, train_sub[period_col], train_sub["p_mean"], train_sub["p_low"], train_sub["p_high"], label="train")
-        test_sub = sub[sub["phase"] == "test"]
-        if not test_sub.empty:
-            line_ci(ax, test_sub[period_col], test_sub["p_mean"], test_sub["p_low"], test_sub["p_high"], label="test")
-        ax.axvline(x=pd.to_datetime(split_dt), linestyle="--")
-        ax.set_title(f"Cohort: {cohort}")
-        ax.set_ylabel("Retention probability")
-        ax.set_xlabel("Period")
-        ax.legend()
-
-    plt.tight_layout()
+    ax.legend(title="cohort", loc="center left", bbox_to_anchor=(1, 0.5), fontsize=7.5)
+    ax.set(title="Retention by Cohort and Period")
     st.pyplot(fig)
-else:
-    st.info("Select at least one cohort to visualize.")
+    plt.close()
 
-# ------------------------------
-# Export
-# ------------------------------
-st.header("Export")
-csv_buf = StringIO()
-plot_all.to_csv(csv_buf, index=False)
-st.download_button(
-    "Download predictions CSV",
-    data=csv_buf.getvalue(),
-    file_name="bart_retention_predictions.csv",
-    mime="text/csv"
-)
+# Model fitting section
+st.header("🤖 Model Training")
 
-st.success("Done.")
+if st.button("🚀 Fit BART Model", type="primary"):
+    with st.spinner("Fitting BART model... This may take several minutes."):
+        try:
+            # Prepare data exactly as in original code
+            seed = sum(map(ord, "retention"))
+            rng = np.random.default_rng(seed=seed)
+            
+            eps = np.finfo(float).eps
+            train_obs_idx = train_data_red_df.index.to_numpy()
+            train_n_users = train_data_red_df["n_users"].to_numpy()
+            train_n_active_users = train_data_red_df["n_active_users"].to_numpy()
+            train_retention = train_data_red_df["retention"].to_numpy()
+            train_retention_logit = logit(train_retention + eps)
+            
+            train_cohort = train_data_red_df["cohort"].to_numpy()
+            train_cohort_encoder = LabelEncoder()
+            train_cohort_idx = train_cohort_encoder.fit_transform(train_cohort).flatten()
+            
+            train_period = train_data_red_df["period"].to_numpy()
+            train_period_encoder = LabelEncoder()
+            train_period_idx = train_period_encoder.fit_transform(train_period).flatten()
+            
+            x_train = train_data_red_df[features]
+            
+            # Build model exactly as in original code
+            with pm.Model(coords={"feature": features}) as model:
+                model.add_coord(name="obs", values=train_obs_idx)
+                x = pm.Data(name="x", value=x_train, dims=("obs", "feature"))
+                n_users = pm.Data(name="n_users", value=train_n_users, dims="obs")
+                n_active_users = pm.Data(name="n_active_users", value=train_n_active_users, dims="obs")
+                
+                mu = pmb.BART(
+                    name="mu",
+                    X=x,
+                    Y=train_retention_logit,
+                    m=n_trees,
+                    response="mix",
+                    split_rules=split_rules,
+                    dims="obs",
+                )
+                p = pm.Deterministic(name="p", var=pm.math.invlogit(mu), dims="obs")
+                p = pt.switch(pt.eq(p, 0), eps, p)
+                p = pt.switch(pt.eq(p, 1), 1 - eps, p)
+                
+                pm.Binomial(name="likelihood", n=n_users, p=p, observed=n_active_users, dims="obs")
+            
+            # Sample
+            progress_bar = st.progress(0, text="Sampling from posterior...")
+            with model:
+                idata = pm.sample(draws=n_draws, chains=n_chains, random_seed=rng)
+                progress_bar.progress(80, text="Generating posterior predictive...")
+                posterior_predictive = pm.sample_posterior_predictive(trace=idata, random_seed=rng)
+            
+            progress_bar.progress(100, text="Complete!")
+            
+            # Store in session state
+            st.session_state.model_fitted = True
+            st.session_state.idata = idata
+            st.session_state.posterior_predictive = posterior_predictive
+            st.session_state.model = model
+            st.session_state.train_data_red_df = train_data_red_df
+            st.session_state.train_n_users = train_n_users
+            st.session_state.train_cohort_encoder = train_cohort_encoder
+            st.session_state.train_cohort_idx = train_cohort_idx
+            st.session_state.train_period = train_period
+            st.session_state.train_period_idx = train_period_idx
+            st.session_state.train_cohort = train_cohort
+            st.session_state.train_retention = train_retention
+            st.session_state.x_train = x_train
+            st.session_state.features = features
+            st.session_state.eps = eps
+            st.session_state.seed = seed
+            st.session_state.rng = rng
+            st.session_state.mu = mu
+            st.session_state.test_data_red_df = test_data_red_df
+            
+            st.success("✅ Model fitted successfully!")
+            st.rerun()
+            
+        except Exception as e:
+            st.error(f"❌ Error fitting model: {str(e)}")
+            import traceback
+            st.code(traceback.format_exc())
+
+# Display results if model is fitted
+if st.session_state.model_fitted:
+    st.header("📊 Model Diagnostics")
+    
+    idata = st.session_state.idata
+    posterior_predictive = st.session_state.posterior_predictive
+    
+    # ESS and Rhat (exactly as in original code)
+    tab1, tab2, tab3 = st.tabs(["ESS & R-hat", "Posterior Predictive Check", "In-Sample Predictions"])
+    
+    with tab1:
+        fig, ax = plt.subplots(
+            nrows=1, ncols=2, figsize=(10, 4), sharex=False, sharey=False, layout="constrained"
+        )
+        
+        # Get ESS and R-hat values
+        ess_data = az.ess(idata, var_names=["mu"], method="bulk")
+        rhat_data = az.rhat(idata, var_names=["mu"])
+        
+        # Extract values
+        ess_values = ess_data["mu"].values.flatten()
+        rhat_values = rhat_data["mu"].values.flatten()
+        
+        # Plot ESS ECDF
+        ess_sorted = np.sort(ess_values)
+        ess_ecdf = np.arange(1, len(ess_sorted) + 1) / len(ess_sorted)
+        ax[0].plot(ess_sorted, ess_ecdf, linewidth=2, color='C0')
+        ax[0].axvline(400, color='red', linestyle='--', linewidth=2, alpha=0.7, label='Threshold (400)')
+        ax[0].set_xlabel("ESS (Bulk)", fontsize=11)
+        ax[0].set_ylabel("Cumulative Probability", fontsize=11)
+        ax[0].set_title("ESS Distribution (ECDF)")
+        ax[0].legend()
+        ax[0].grid(True, alpha=0.3)
+        
+        # Plot R-hat ECDF
+        rhat_sorted = np.sort(rhat_values)
+        rhat_ecdf = np.arange(1, len(rhat_sorted) + 1) / len(rhat_sorted)
+        ax[1].plot(rhat_sorted, rhat_ecdf, linewidth=2, color='C1')
+        ax[1].axvline(1.01, color='red', linestyle='--', linewidth=2, alpha=0.7, label='Threshold (1.01)')
+        ax[1].set_xlabel("R-hat", fontsize=11)
+        ax[1].set_ylabel("Cumulative Probability", fontsize=11)
+        ax[1].set_title("R-hat Distribution (ECDF)")
+        
+        # Fix R-hat axis
+        ax[1].set_xlim(1.000, rhat_sorted.max() * 1.01)
+        ax[1].xaxis.set_major_locator(plt.MaxNLocator(6))
+        ax[1].xaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.3f}'))
+        
+        ax[1].legend()
+        ax[1].grid(True, alpha=0.3)
+        
+        fig.suptitle("Diagnostics of the BART Component", y=1.06, fontsize=16)
+        st.pyplot(fig)
+        plt.close()
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Min ESS", f"{ess_values.min():.0f}")
+            st.metric("Mean ESS", f"{ess_values.mean():.0f}")
+        with col2:
+            st.metric("Max R-hat", f"{rhat_values.max():.4f}")
+            st.metric("Mean R-hat", f"{rhat_values.mean():.4f}")
+    
+    with tab2:
+        # Posterior Predictive Check (exactly as in original code)
+        fig, ax = plt.subplots(figsize=(10, 6))
+        az.plot_ppc(
+            data=posterior_predictive,
+            kind="cumulative",
+            observed_rug=True,
+            random_seed=st.session_state.seed,
+            ax=ax
+        )
+        ax.set(
+            title="Posterior Predictive Check",
+            xscale="log",
+            xlabel="likelihood (n_active_users) - log scale",
+        )
+        st.pyplot(fig)
+        plt.close()
+    
+    with tab3:
+        # In-sample predictions (exactly as in original code)
+        train_posterior_retention = (
+            posterior_predictive.posterior_predictive / st.session_state.train_n_users[np.newaxis, None]
+        )
+        train_posterior_retention_mean = az.extract(
+            data=train_posterior_retention, var_names=["likelihood"]
+        ).mean("sample")
+        
+        fig, ax = plt.subplots(figsize=(10, 9))
+        sns.scatterplot(
+            x="retention",
+            y="posterior_retention_mean",
+            data=st.session_state.train_data_red_df.assign(
+                posterior_retention_mean=train_posterior_retention_mean
+            ),
+            hue="age",
+            palette="viridis_r",
+            size="n_users",
+            ax=ax,
+        )
+        ax.axline(xy1=(0, 0), slope=1, color="black", linestyle="--", label="diagonal")
+        ax.legend()
+        ax.set(title="Posterior Predictive - Retention Mean")
+        st.pyplot(fig)
+        plt.close()
+    
+    # HDI Plots for subset of cohorts (exactly as in original code)
+    st.header("🎯 In-Sample Retention HDI")
+    
+    train_retention_hdi = az.hdi(ary=train_posterior_retention)["likelihood"]
+    
+    def plot_train_retention_hdi_cohort(cohort_index, ax):
+        mask = st.session_state.train_cohort_idx == cohort_index
+        train_period = st.session_state.train_period
+        train_period_idx = st.session_state.train_period_idx
+        train_retention = st.session_state.train_retention
+        train_cohort_encoder = st.session_state.train_cohort_encoder
+        
+        ax.fill_between(
+            x=train_period[train_period_idx[mask]],
+            y1=train_retention_hdi[mask, :][:, 0],
+            y2=train_retention_hdi[mask, :][:, 1],
+            alpha=0.3,
+            color="C0",
+            label="94% HDI (train)",
+        )
+        sns.lineplot(
+            x=train_period[train_period_idx[mask]],
+            y=train_retention[mask],
+            color="C0",
+            marker="o",
+            label="observed (train)",
+            ax=ax,
+        )
+        cohort_name = (
+            pd.to_datetime(train_cohort_encoder.classes_[cohort_index]).date().isoformat()
+        )
+        ax.legend(loc="upper left")
+        ax.set(title=f"Retention HDI - Cohort {cohort_name}")
+        return ax
+    
+    cohort_index_to_plot = [0, 1, 5, 10, 15, 20, 25, 30]
+    # Filter to available cohorts
+    max_cohort_idx = st.session_state.train_cohort_encoder.classes_.shape[0] - 1
+    cohort_index_to_plot = [idx for idx in cohort_index_to_plot if idx <= max_cohort_idx]
+    
+    fig, axes = plt.subplots(
+        nrows=int(np.ceil(len(cohort_index_to_plot) / 2)),
+        ncols=2,
+        figsize=(17, 11),
+        sharex=True,
+        sharey=True,
+        layout="constrained",
+    )
+    
+    for cohort_index, ax in zip(cohort_index_to_plot, axes.flatten()):
+        plot_train_retention_hdi_cohort(cohort_index=cohort_index, ax=ax)
+    
+    # Hide extra subplots
+    for idx in range(len(cohort_index_to_plot), len(axes.flatten())):
+        axes.flatten()[idx].set_visible(False)
+    
+    fig.suptitle("In-Sample Retention HDI", y=1.03, fontsize=20, fontweight="bold")
+    fig.autofmt_xdate()
+    st.pyplot(fig)
+    plt.close()
+    
+    # PDP Plots (exactly as in original code)
+    st.header("📉 Partial Dependence Plots (PDP)")
+    
+    with st.spinner("Computing PDP plots..."):
+        try:
+            axes = pmb.plot_pdp(
+                bartrv=st.session_state.mu,
+                X=st.session_state.x_train,
+                Y=st.session_state.train_retention,
+                func=expit,
+                xs_interval="insample",
+                samples=1_000,
+                grid="wide",
+                color="C2",
+                color_mean="C2",
+                var_discrete=[2],
+                figsize=(12, 7),
+                random_seed=st.session_state.seed,
+            )
+            axes[0].set(ylim=(0, 0.2))
+            plt.gcf().suptitle(
+                "Partial Dependency Plots (PDP) - Retention",
+                fontsize=16,
+                y=1.02,
+            )
+            st.pyplot(plt.gcf())
+            plt.close()
+        except Exception as e:
+            st.error(f"Error computing PDP: {str(e)}")
+    
+    # ICE Plots (exactly as in original code)
+    st.header("❄️ Individual Conditional Expectation (ICE) Plots")
+    
+    with st.spinner("Computing ICE plots..."):
+        try:
+            axes = pmb.plot_ice(
+                bartrv=st.session_state.mu,
+                X=st.session_state.x_train,
+                Y=st.session_state.train_retention,
+                func=expit,
+                centered=False,
+                samples=200,
+                instances=20,
+                grid="wide",
+                color="C2",
+                color_mean="C2",
+                var_discrete=[2],
+                figsize=(12, 7),
+                random_seed=st.session_state.seed,
+            )
+            axes[0].set(ylim=(0, 0.2))
+            plt.gcf().suptitle(
+                "Individual Conditional Expectation (ICE) Plots - Retention",
+                fontsize=16,
+                y=1.02,
+            )
+            st.pyplot(plt.gcf())
+            plt.close()
+        except Exception as e:
+            st.error(f"Error computing ICE: {str(e)}")
+    
+    # Variable Importance (exactly as in original code)
+    st.header("🔍 Variable Importance")
+    
+    with st.spinner("Computing variable importance..."):
+        try:
+            # Compute variable importance
+            vi_results = pmb.compute_variable_importance(
+                idata=idata,
+                bartrv=st.session_state.mu,
+                X=st.session_state.x_train,
+                random_seed=st.session_state.seed
+            )
+            
+            # Get variable inclusion
+            vi_inclusion_values, vi_inclusion_labels = pmb.get_variable_inclusion(
+                idata=idata,
+                X=st.session_state.x_train
+            )
+            
+            # Create figure with 2 subplots
+            fig, axes = plt.subplots(2, 1, figsize=(10, 8))
+            
+            # Plot 1: Variable inclusion
+            axes[0].plot(range(len(vi_inclusion_labels)), vi_inclusion_values, marker='o', linewidth=2, color='C0')
+            axes[0].set_xticks(range(len(vi_inclusion_labels)))
+            axes[0].set_xticklabels(vi_inclusion_labels)
+            axes[0].set_ylabel("importance", fontsize=11)
+            axes[0].set_xlabel("covariables", fontsize=11)
+            axes[0].grid(True, alpha=0.3)
+            
+            # Plot 2: R² contribution
+            plt.sca(axes[1])
+            pmb.plot_variable_importance(
+                vi_results=vi_results,
+                labels=st.session_state.features,
+                ax=axes[1]
+            )
+            
+            fig.suptitle("Variable Importance", fontsize=16, y=0.995)
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close()
+            
+        except Exception as e:
+            st.warning(f"Could not compute variable importance: {str(e)}")
+    
+    # Out-of-Sample Predictions
+    st.header("🔮 Out-of-Sample Predictions")
+    
+    if st.button("Generate Test Predictions"):
+        with st.spinner("Generating out-of-sample predictions..."):
+            try:
+                # Prepare test data
+                test_data_red_df = st.session_state.test_data_red_df
+                test_obs_idx = test_data_red_df.index.to_numpy()
+                test_n_users = test_data_red_df["n_users"].to_numpy()
+                test_n_active_users = test_data_red_df["n_active_users"].to_numpy()
+                test_retention = test_data_red_df["retention"].to_numpy()
+                
+                test_cohort = test_data_red_df["cohort"].to_numpy()
+                test_cohort_idx = st.session_state.train_cohort_encoder.transform(test_cohort).flatten()
+                
+                x_test = test_data_red_df[st.session_state.features]
+                
+                # Out-of-sample predictions
+                with st.session_state.model:
+                    pm.set_data(
+                        new_data={
+                            "x": x_test,
+                            "n_users": test_n_users,
+                            "n_active_users": np.ones_like(test_n_active_users),
+                        },
+                        coords={"obs": test_obs_idx},
+                    )
+                    idata.extend(
+                        pm.sample_posterior_predictive(
+                            trace=idata,
+                            var_names=["likelihood", "p", "mu"],
+                            idata_kwargs={"coords": {"obs": test_obs_idx}},
+                        )
+                    )
+                
+                # Store test predictions
+                st.session_state.test_predictions_ready = True
+                st.session_state.test_data_red_df = test_data_red_df
+                st.session_state.test_cohort_idx = test_cohort_idx
+                st.session_state.test_retention = test_retention
+                st.session_state.test_n_users = test_n_users
+                
+                st.success("✅ Test predictions generated!")
+                st.rerun()
+                
+            except Exception as e:
+                st.error(f"Error generating test predictions: {str(e)}")
+                import traceback
+                st.code(traceback.format_exc())
+    
+    # Display test predictions if ready
+    if hasattr(st.session_state, 'test_predictions_ready') and st.session_state.test_predictions_ready:
+        st.subheader("Test Set Retention Predictions")
+        
+        test_posterior_retention = (
+            idata.posterior_predictive["likelihood"] / st.session_state.test_n_users[np.newaxis, None]
+        )
+        test_retention_hdi = az.hdi(ary=test_posterior_retention)["likelihood"]
+        
+        def plot_test_retention_hdi_cohort(cohort_index, ax):
+            mask = st.session_state.test_cohort_idx == cohort_index
+            
+            test_period_range = st.session_state.test_data_red_df.query(
+                f"cohort == '{st.session_state.train_cohort_encoder.classes_[cohort_index]}'"
+            )["period"]
+            
+            ax.fill_between(
+                x=test_period_range,
+                y1=test_retention_hdi[mask, :][:, 0],
+                y2=test_retention_hdi[mask, :][:, 1],
+                alpha=0.3,
+                color="C1",
+                label="94% HDI (test)",
+            )
+            sns.lineplot(
+                x=test_period_range,
+                y=st.session_state.test_retention[mask],
+                color="C1",
+                marker="o",
+                label="observed (test)",
+                ax=ax,
+            )
+            return ax
+        
+        # Combined train/test plots
+        fig, axes = plt.subplots(
+            nrows=len(cohort_index_to_plot),
+            ncols=1,
+            figsize=(15, 16),
+            sharex=True,
+            sharey=True,
+            layout="constrained",
+        )
+        
+        for cohort_index, ax in zip(cohort_index_to_plot, axes.flatten()):
+            plot_train_retention_hdi_cohort(cohort_index=cohort_index, ax=ax)
+            plot_test_retention_hdi_cohort(cohort_index=cohort_index, ax=ax)
+            ax.axvline(
+                x=pd.to_datetime(period_train_test_split),
+                color="black",
+                linestyle="--",
+                label="train/test split",
+            )
+            ax.legend(loc="center left", bbox_to_anchor=(1, 0.5))
+        
+        fig.suptitle("Retention Predictions", y=1.03, fontsize=20, fontweight="bold")
+        st.pyplot(fig)
+        plt.close()
+
+# Footer
+st.markdown("---")
+st.markdown("""
+**About**: This app uses Bayesian Additive Regression Trees (BART) for retention modeling.
+Based on PyMC-BART implementation with full Bayesian inference.
+""")
